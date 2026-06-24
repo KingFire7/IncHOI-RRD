@@ -145,6 +145,7 @@ class TransformerDecoderLayer(nn.Module):
             qk_attn_mask: Optional[Tensor] = None,
             q_padding_mask: Optional[Tensor] = None,
             kv_padding_mask: Optional[Tensor] = None,
+            return_cross_attn: bool = False,  # 新增参数
         ):
         """
         Parameters:
@@ -202,14 +203,17 @@ class TransformerDecoderLayer(nn.Module):
         k_p = k_p.view(hw, bs, self.num_heads, self.q_dim // self.num_heads)
         k = torch.cat([k, k_p], dim=3).view(hw, bs, self.q_dim * 2)
 
-        qk_attn = self.qk_attn(
+        qk_attn, qk_attn_weights = self.qk_attn( #新增
             query=q, key=k, value=v, attn_mask=qk_attn_mask,
             key_padding_mask=kv_padding_mask
-        )[0]
+        )
         queries = self.ln2(queries + self.dp2(qk_attn))
         queries = self.ln3(queries + self.dp3(self.ffn(queries)))
 
-        return queries
+        if return_cross_attn: #新增
+            return queries, qk_attn_weights
+        else:
+            return queries
 
 class TransformerDecoder(nn.Module):
 
@@ -234,6 +238,7 @@ class TransformerDecoder(nn.Module):
             kv_padding_mask: Optional[Tensor] = None,
             q_pos: Optional[Tensor] = None,
             k_pos: Optional[Tensor] = None,
+            return_cross_attn: bool = False,  # 新增参数
         ):
         # Add support for zero layers
         if self.num_layers == 0:
@@ -245,15 +250,29 @@ class TransformerDecoder(nn.Module):
 
         output = queries
         intermediate = []
-        for layer in self.layers:
-            output = layer(
-                output, features,
-                q_attn_mask=q_attn_mask,
-                qk_attn_mask=qk_attn_mask,
-                q_padding_mask=q_padding_mask,
-                kv_padding_mask=kv_padding_mask,
-                q_pos=q_pos, k_pos=k_pos,
-            )
+        cross_attn_weights_list = [] # 新增
+
+        for layer in self.layers: # 新增
+            if return_cross_attn:
+                output, cross_attn_weights = layer(
+                    output, features,
+                    q_attn_mask=q_attn_mask,
+                    qk_attn_mask=qk_attn_mask,
+                    q_padding_mask=q_padding_mask,
+                    kv_padding_mask=kv_padding_mask,
+                    q_pos=q_pos, k_pos=k_pos,
+                    return_cross_attn=True
+                )
+                cross_attn_weights_list.append(cross_attn_weights)
+            else:
+                output = layer(
+                    output, features,
+                    q_attn_mask=q_attn_mask,
+                    qk_attn_mask=qk_attn_mask,
+                    q_padding_mask=q_padding_mask,
+                    kv_padding_mask=kv_padding_mask,
+                    q_pos=q_pos, k_pos=k_pos
+                )
             if self.return_intermediate:
                 intermediate.append(self.norm(output))
 
@@ -261,7 +280,11 @@ class TransformerDecoder(nn.Module):
             output = torch.stack(intermediate)
         else:
             output = self.norm(output).unsqueeze(0)
-        return output
+
+        if return_cross_attn: # 新增
+            return output, cross_attn_weights_list
+        else:
+            return output
 
 
 def _get_relative_position_bias(

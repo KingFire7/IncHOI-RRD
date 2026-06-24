@@ -402,8 +402,12 @@ class PViC(nn.Module):
 
     def forward(self,
         images: List[Tensor],
-        targets: Optional[List[dict]] = None
-    ) -> List[dict]:
+        targets: Optional[List[dict]] = None,
+        return_cross_attn: bool = False,  # 新增参数
+        return_outputs=False,
+        teacher_cross_attn_hint=None,
+        attn_hint_alpha=0.05,
+        use_vas=False, is_replay_list=None, sis_scores=None, vas_lambda=0.0) -> List[dict]:
         """
         Parameters:
         -----------
@@ -461,31 +465,171 @@ class PViC(nn.Module):
         kv_p_m = mask.reshape(-1, 1, h * w)
         k_pos = self.kv_pe(NestedTensor(memory, mask)).permute(0, 2, 3, 1).reshape(b, h * w, 1, c)
         # Enhance visual context with triplet decoder.
-        query_embeds = []
-        for i, (ho_q, mem) in enumerate(zip(ho_queries, memory)):
-            query_embeds.append(self.decoder(
-                ho_q.unsqueeze(1),              # (n, 1, q_dim)
-                mem.unsqueeze(1),               # (hw, 1, kv_dim)
-                kv_padding_mask=kv_p_m[i],      # (1, hw)
-                q_pos=positional_embeds[i],     # centre: (n, 1, 2*kv_dim), box: (n, 1, 4*kv_dim)
-                k_pos=k_pos[i]                  # (hw, 1, kv_dim)
-            ).squeeze(dim=2))
-        # Concatenate queries from all images in the same batch.
-        query_embeds = torch.cat(query_embeds, dim=1)   # (ndec, \sigma{n}, q_dim)
+        query_embeds = [None] * len(ho_queries)
+        cross_attn_weights_list = [None] * len(ho_queries)
+        if use_vas and is_replay_list is not None and True in is_replay_list and False in is_replay_list:
+            # === 开启 VAS 模式 (Batch中同时包含新旧样本) ===
+            print(f"[Debug] VAS Triggered! New samples: {is_replay_list.count(False)}, Old samples: {is_replay_list.count(True)}", flush=True)
+            new_indices = [i for i, r in enumerate(is_replay_list) if not r]
+            old_indices = [i for i, r in enumerate(is_replay_list) if r]
+
+            # [阶段1]：处理新任务样本，提取干涉源 M_dist
+            new_attns = []
+            for i in new_indices:
+                out, cw = self.decoder(
+                    ho_queries[i].unsqueeze(1), memory[i].unsqueeze(1),
+                    kv_padding_mask=kv_p_m[i], q_pos=positional_embeds[i], k_pos=k_pos[i],
+                    return_cross_attn=True
+                )
+                query_embeds[i] = out.squeeze(dim=2)
+                cross_attn_weights_list[i] = cw
+
+                # 提取单张图片的注意力矩阵 [1, heads, num_queries, h*w]
+                cw_last_layer = cw[-1] if isinstance(cw, list) else cw
+
+                # ✅ 关键修复：先在内部沿着 batch(0), heads(1), queries(2) 维度求平均
+                # 将形状从 [1, 8, num_queries, 1050] 降维成 [1050] 的纯空间分布
+                spatial_map = cw_last_layer.detach().mean(dim=(0, 1, 2))
+                new_attns.append(spatial_map)
+
+            # 计算 M_dist (干涉源分布)
+            if len(new_attns) > 0:
+                # 此时 new_attns 里的每个元素都是形状严格相同的 [1050] 张量
+                stacked_attns = torch.stack(new_attns) # 形状: [新样本数量, 1050]
+                # 在样本维度上取平均，得到 Batch 级别的新知识视觉干涉热区
+                m_dist = stacked_attns.mean(dim=0)     # 形状: [1050]
+
+                # 归一化到 0~1 之间，确保排斥力度 (P_bias) 的相对稳定性
+                m_dist = (m_dist - m_dist.min()) / (m_dist.max() - m_dist.min() + 1e-8)
+            else:
+                m_dist = None
+
+            # [阶段2]：处理旧样本，施加基于 SIS 的负向偏置 P_bias
+            for i in old_indices:
+                sis = sis_scores[i]
+                memory_mask = None
+
+                if m_dist is not None and sis > 0:
+                    # 惩罚项: P_bias = lambda * SIS * M_dist
+                    num_queries = ho_queries[i].shape[0]
+                    # 扩展至 [num_queries, h*w]
+                    p_bias = vas_lambda * sis * m_dist.unsqueeze(0).expand(num_queries, -1)
+                    memory_mask = -p_bias # 负向偏置
+
+                out, cw = self.decoder(
+                    ho_queries[i].unsqueeze(1), memory[i].unsqueeze(1),
+                    kv_padding_mask=kv_p_m[i], q_pos=positional_embeds[i], k_pos=k_pos[i],
+                    qk_attn_mask=memory_mask, # ✅ 关键修复：将 memory_mask 改为 qk_attn_mask !
+                    return_cross_attn=True
+                )
+                query_embeds[i] = out.squeeze(dim=2)
+                cross_attn_weights_list[i] = cw
+        else:
+            for i, (ho_q, mem) in enumerate(zip(ho_queries, memory)):
+                out, cross_attn_weights = self.decoder(
+                    ho_q.unsqueeze(1), mem.unsqueeze(1), kv_padding_mask=kv_p_m[i],
+                    q_pos=positional_embeds[i], k_pos=k_pos[i], return_cross_attn=True
+                )
+                out = out.squeeze(dim=2)
+                # ------ 关键：Hint分支仅限shape完全对齐时融合，否则用student ------
+                if (
+                    teacher_cross_attn_hint is not None and
+                    i < len(teacher_cross_attn_hint) and
+                    teacher_cross_attn_hint[i] is not None
+                ):
+                    th = teacher_cross_attn_hint[i]
+                    cw = cross_attn_weights
+                    # 有的包实现返回list，多层，仅取最后一层
+                    if isinstance(th, list):
+                        th = th[-1]
+                    if isinstance(cw, list):
+                        cw = cw[-1]
+                    # 核心防呆：只有在完全shape一致时融合
+                    if th.shape == cw.shape:
+                        cross_attn_weights = (1 - attn_hint_alpha) * cw + attn_hint_alpha * th.detach()
+                        # print(f"[Hint] Blended student & teacher at batch {i}")
+                    else:
+                        # print(f"[Hint] SKIPPED at batch {i}: student {cw.shape}, teacher {th.shape}")
+                        cross_attn_weights = cw
+                query_embeds[i] = out
+                cross_attn_weights_list[i] = cross_attn_weights
+        # cat之前加这段：
+        base_shape = (query_embeds[0].shape[0], query_embeds[0].shape[2])
+        query_embeds_to_cat = []
+        for idx, q in enumerate(query_embeds):
+            if q.shape[0] == base_shape[0] and q.shape[2] == base_shape[1]:
+                query_embeds_to_cat.append(q)
+            else:
+                print(f"[CAT SKIP] idx {idx}, shape {q.shape}, base {base_shape}", flush=True)
+        if len(query_embeds_to_cat) == 0:
+            # fallback dummy
+            dummy = torch.zeros((base_shape[0], 1, base_shape[1]), device=query_embeds[0].device, dtype=query_embeds[0].dtype)
+            query_embeds_to_cat = [dummy]
+        query_embeds = torch.cat(query_embeds_to_cat, dim=1)
+        # query_embeds = torch.cat(query_embeds, dim=1)
         logits = self.binary_classifier(query_embeds)
+        pred_logits = logits      # [num_decoder_layers, N_pairs, num_verbs]
+        pred_boxes = None         # <-- If you have box regression, add here
+        if query_embeds.shape[0] == 0:
+            # fallback/dummy，建议和你的repr_size一致
+            feat = torch.zeros((1, query_embeds.shape[-1]), device=query_embeds.device, dtype=query_embeds.dtype)
+            print("[Warning] Query_embeds is empty, fallback to zero feature.", flush=True)
+        elif query_embeds.shape[0] == 1:
+            feat = query_embeds[-1]
+        else:
+            feat = query_embeds[-2]
+        # feat = query_embeds[-2] if query_embeds.shape[0] > 1 else query_embeds[-1]  # [N_pairs, repr_dim]
 
         if self.training:
             labels = associate_with_ground_truth(
                 boxes, paired_inds, targets, self.num_verbs
             )
             cls_loss = self.compute_classification_loss(logits, prior_scores, labels)
-            loss_dict = dict(cls_loss=cls_loss)
-            return loss_dict
+                # 组装用于蒸馏的输出
+
+            # 计算pair_image_indices
+            pair_image_indices = []
+            pair_idx_in_image = []
+            for img_idx, p_inds in enumerate(paired_inds):
+                pair_image_indices.extend([img_idx] * len(p_inds))
+                pair_idx_in_image.extend(list(range(len(p_inds))))
+            pair_image_indices = torch.tensor(pair_image_indices, device=feat.device)  # [num_pairs]
+            pair_idx_in_image = torch.tensor(pair_idx_in_image, device=feat.device)    # [num_pairs]
+
+
+            output_dict = {
+                'cls_loss': cls_loss,
+                'pred_logits': pred_logits,
+                'feat': feat,
+                'pair_image_indices': pair_image_indices,  # 新增
+                'pair_idx_in_image': pair_idx_in_image,    # 新增
+
+            }
+            #loss_dict = dict(cls_loss=cls_loss)
+                    # pred_boxes（如果有）也可以加入
+            if pred_boxes is not None:
+                output_dict['pred_boxes'] = pred_boxes
+            if return_outputs:
+                if return_cross_attn:
+                    return output_dict, cross_attn_weights_list  # 若你已经构造过cross_attn_weights_list
+                    # 或 return output_dict, None
+                else:
+                    return output_dict
+            else:
+                if return_cross_attn:
+                    return {'cls_loss': cls_loss}, cross_attn_weights_list  # 或None
+                else:
+                    return {'cls_loss': cls_loss}
 
         detections = self.postprocessing(
             boxes, paired_inds, object_types,
             logits[-1], prior_scores, image_sizes
         )
+        if return_cross_attn:
+            return logits, cross_attn_weights_list
+        else:
+            # 旧逻辑
+            pass
         return detections
 
 def build_detector(args, obj_to_verb):

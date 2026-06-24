@@ -1,6 +1,38 @@
 .DS_Store
 .amltignore
-checkpoints
+checkpoints/
+
+# Local datasets, checkpoints and experiment artefacts
+outputs/
+logs/
+infer_vis_results/
+eval_forgetting_results/
+viz/
+viz_comp/
+historical_runs/
+assets/DEMO1.jpg
+assets/pair_33_attn_head_2.png
+assets/pair_33_attn_head_3.png
+assets/pair_33_attn_head_4.png
+assets/pair_33_attn_head_5.png
+assets/pair_33_attn_head_7.png
+assets/pair_33_attn_head_8.png
+*.pth
+*.pt
+*.ckpt
+*.tar
+*.tar.gz
+
+# Local scratch files and manually retained revisions
+* copy.py
+* copy 2.py
+* copy 3.py
+test.sh
+历史训练log/
+
+# Dataset payloads downloaded inside submodule directories
+hicodet/hico_20160224_det/
+vcoco/mscoco2014/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

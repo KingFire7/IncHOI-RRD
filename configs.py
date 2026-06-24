@@ -57,6 +57,20 @@ def base_detector_args():
     parser.add_argument('--output-dir', default='checkpoints')
     parser.add_argument('--pretrained', default='', help='Path to a pretrained detector')
     parser.add_argument('--print-interval', default=100, type=int)
+
+    # === 修改部分 ===
+    parser.add_argument('--split-mode', default='random', type=str,
+                        choices=['random', 'rare_first', 'non_rare_first', 'paper_5phase', 'paper_10phase'],
+                        help='任务分割策略: paper_5phase/10phase 为复现论文的筛选分割策略')
+
+    parser.add_argument('--eval-mode', default='default', type=str,
+                        choices=['default', 'all', 'current', 'unseen', 'seen_valid'],
+                        help='测试模式: default(已学), unseen(零样本/未见组合), seen_valid(所有符合论文筛选的训练类)')
+
+    # 论文复现用的排除列表（可选，根据实际数据集调整）
+    parser.add_argument('--filter-no-interaction', action='store_true', default=True,
+                        help='是否在复现模式下预先剔除no_interaction等类别')
+
     return parser
 
 def advanced_detector_args():
@@ -139,4 +153,13 @@ def advanced_detector_args():
     parser.add_argument('--output-dir', default='checkpoints')
     parser.add_argument('--pretrained', default='', help='Path to a pretrained detector')
     parser.add_argument('--print-interval', default=100, type=int)
+
+    parser.add_argument('--split-mode', default='random', type=str,
+                        choices=['random', 'rare_first', 'non_rare_first', 'paper_5phase', 'paper_10phase'],
+                        help='任务分割策略')
+    parser.add_argument('--eval-mode', default='default', type=str,
+                        choices=['default', 'all', 'current', 'unseen', 'seen_valid'],
+                        help='测试模式')
+    parser.add_argument('--filter-no-interaction', action='store_true', default=True,
+                        help='是否在复现模式下预先剔除no_interaction等类别')
     return parser
