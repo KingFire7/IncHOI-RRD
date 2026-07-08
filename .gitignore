@@ -4,6 +4,7 @@ checkpoints/
 
 # Local datasets, checkpoints and experiment artefacts
 outputs/
+outputs-rgip/
 logs/
 infer_vis_results/
 eval_forgetting_results/

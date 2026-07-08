@@ -146,6 +146,7 @@ class TransformerDecoderLayer(nn.Module):
             q_padding_mask: Optional[Tensor] = None,
             kv_padding_mask: Optional[Tensor] = None,
             return_cross_attn: bool = False,  # 新增参数
+            rgip_attn_context: Optional[dict] = None,
         ):
         """
         Parameters:
@@ -186,26 +187,19 @@ class TransformerDecoderLayer(nn.Module):
             key_padding_mask=q_padding_mask
         )[0]
         queries = self.ln1(queries + self.dp1(q_attn))
-        # Perform cross attention from memory features to queries
-        q = self.qk_attn_q_proj(queries)
-        k = self.qk_attn_k_proj(features)
+        # Perform cross attention from memory features to queries.
+        # Split content and position logits so RGIP can modulate content only.
+        q_content = self.qk_attn_q_proj(queries)
+        k_content = self.qk_attn_k_proj(features)
         v = self.qk_attn_v_proj(features)
-        q_p = self.qk_attn_qpos_proj(q_pos["centre"])
-        k_p = self.qk_attn_kpos_proj(k_pos)
+        q_position = self.qk_attn_qpos_proj(q_pos["centre"])
+        k_position = self.qk_attn_kpos_proj(k_pos)
 
-        n_q, bs, _ = q.shape
-        q = q.view(n_q, bs, self.num_heads, self.q_dim // self.num_heads)
-        q_p = q_p.view(n_q, bs, self.num_heads, self.q_dim // self.num_heads)
-        q = torch.cat([q, q_p], dim=3).view(n_q, bs, self.q_dim * 2)
-
-        hw, _, _ = k.shape
-        k = k.view(hw, bs, self.num_heads, self.q_dim // self.num_heads)
-        k_p = k_p.view(hw, bs, self.num_heads, self.q_dim // self.num_heads)
-        k = torch.cat([k, k_p], dim=3).view(hw, bs, self.q_dim * 2)
-
-        qk_attn, qk_attn_weights = self.qk_attn( #新增
-            query=q, key=k, value=v, attn_mask=qk_attn_mask,
-            key_padding_mask=kv_padding_mask
+        qk_attn, qk_attn_weights = self._content_position_cross_attention(
+            q_content, k_content, v, q_position, k_position,
+            attn_mask=qk_attn_mask,
+            key_padding_mask=kv_padding_mask,
+            rgip_attn_context=rgip_attn_context,
         )
         queries = self.ln2(queries + self.dp2(qk_attn))
         queries = self.ln3(queries + self.dp3(self.ffn(queries)))
@@ -214,6 +208,173 @@ class TransformerDecoderLayer(nn.Module):
             return queries, qk_attn_weights
         else:
             return queries
+
+    def _reshape_to_heads(self, x: Tensor) -> Tensor:
+        seq_len, batch_size, _ = x.shape
+        head_dim = self.q_dim // self.num_heads
+        return x.contiguous().view(seq_len, batch_size * self.num_heads, head_dim).transpose(0, 1)
+
+    def _merge_heads(self, x: Tensor, seq_len: int, batch_size: int) -> Tensor:
+        head_dim = self.q_dim // self.num_heads
+        return x.transpose(0, 1).contiguous().view(seq_len, batch_size, self.num_heads * head_dim)
+
+    def _content_position_cross_attention(
+        self,
+        q_content: Tensor,
+        k_content: Tensor,
+        value: Tensor,
+        q_position: Tensor,
+        k_position: Tensor,
+        attn_mask: Optional[Tensor] = None,
+        key_padding_mask: Optional[Tensor] = None,
+        rgip_attn_context: Optional[dict] = None,
+    ):
+        n_q, batch_size, _ = q_content.shape
+        hw = k_content.shape[0]
+        head_dim = self.q_dim // self.num_heads
+        scale = float(2 * head_dim) ** -0.5
+
+        q_content_h = self._reshape_to_heads(q_content)
+        k_content_h = self._reshape_to_heads(k_content)
+        q_position_h = self._reshape_to_heads(q_position)
+        k_position_h = self._reshape_to_heads(k_position)
+        value_h = self._reshape_to_heads(value)
+
+        e_content = torch.bmm(q_content_h, k_content_h.transpose(1, 2)) * scale
+        e_position = torch.bmm(q_position_h, k_position_h.transpose(1, 2)) * scale
+        attn_logits = e_content + e_position
+
+        content_bias = self._build_rgip_content_bias(
+            rgip_attn_context,
+            k_content_h=k_content_h,
+            e_position=e_position,
+            batch_size=batch_size,
+            n_q=n_q,
+            hw=hw,
+            scale=scale,
+        )
+        if content_bias is not None:
+            attn_logits = attn_logits + content_bias
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.uint8:
+                attn_mask = attn_mask.to(torch.bool)
+            if attn_mask.dim() == 2:
+                attn_mask = attn_mask.unsqueeze(0)
+            if attn_mask.dtype == torch.bool:
+                attn_logits = attn_logits.masked_fill(attn_mask, float('-inf'))
+            else:
+                attn_logits = attn_logits + attn_mask.to(attn_logits.device, dtype=attn_logits.dtype)
+
+        if key_padding_mask is not None:
+            if key_padding_mask.dtype == torch.uint8:
+                key_padding_mask = key_padding_mask.to(torch.bool)
+            attn_logits = attn_logits.view(batch_size, self.num_heads, n_q, hw)
+            attn_logits = attn_logits.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2),
+                float('-inf'),
+            )
+            attn_logits = attn_logits.view(batch_size * self.num_heads, n_q, hw)
+
+        attn_weights = F.softmax(
+            attn_logits - attn_logits.max(dim=-1, keepdim=True)[0], dim=-1
+        )
+        attn_weights = F.dropout(attn_weights, p=self.qk_attn.dropout, training=self.training)
+
+        attn_output = torch.bmm(attn_weights, value_h)
+        attn_output = self._merge_heads(attn_output, n_q, batch_size)
+        attn_output = self.qk_attn.out_proj(attn_output)
+        attn_weights = attn_weights.view(batch_size, self.num_heads, n_q, hw)
+        return attn_output, attn_weights
+
+    def _build_rgip_content_bias(
+        self,
+        rgip_attn_context: Optional[dict],
+        k_content_h: Tensor,
+        e_position: Tensor,
+        batch_size: int,
+        n_q: int,
+        hw: int,
+        scale: float,
+    ) -> Optional[Tensor]:
+        if rgip_attn_context is None or batch_size != 1:
+            return None
+        if rgip_attn_context.get('lambda_attn', 0.0) <= 0:
+            return None
+        if 'confounder_prototypes' not in rgip_attn_context:
+            return None
+
+        prototypes = rgip_attn_context['confounder_prototypes']
+        if prototypes is None or prototypes.numel() == 0:
+            return None
+
+        device = k_content_h.device
+        dtype = k_content_h.dtype
+        prototypes = prototypes.to(device=device, dtype=dtype)
+        sis = rgip_attn_context.get('sis', None)
+        modulate_mask = rgip_attn_context.get('modulate_mask', None)
+        confounder_weights = rgip_attn_context.get('confounder_weights', None)
+        if sis is None or modulate_mask is None or confounder_weights is None:
+            return None
+
+        sis = sis.to(device=device, dtype=dtype)
+        modulate_mask = modulate_mask.to(device=device, dtype=torch.bool)
+        confounder_weights = confounder_weights.to(device=device, dtype=dtype)
+        n_ctx = min(n_q, prototypes.shape[0], sis.shape[0], modulate_mask.shape[0])
+        if n_ctx == 0:
+            return None
+
+        lambda_attn = float(rgip_attn_context.get('lambda_attn', 0.0))
+        kappa = float(rgip_attn_context.get('kappa', 1.0))
+        attn_clamp = float(rgip_attn_context.get('attn_clamp', 5.0))
+        bias = torch.zeros_like(e_position)
+        position_support = F.softmax(
+            e_position.detach() - e_position.detach().max(dim=-1, keepdim=True)[0], dim=-1
+        )
+        if kappa != 1.0:
+            position_support = position_support.clamp_min(1e-8).pow(kappa)
+
+        query_indices = torch.nonzero(modulate_mask[:n_ctx], as_tuple=False).flatten()
+        max_attn_pairs = int(rgip_attn_context.get('max_attn_pairs', 16) or 16)
+        max_attn_pairs = max(1, max_attn_pairs)
+        if query_indices.numel() > max_attn_pairs:
+            query_sis = sis[query_indices].to(dtype=torch.float32)
+            order = torch.argsort(query_sis, descending=True)
+            query_indices = query_indices[order[:max_attn_pairs]]
+
+        for query_idx in query_indices.tolist():
+            query_prototypes = prototypes[query_idx]
+            valid_proto = query_prototypes.abs().sum(dim=-1) > 0
+            if not torch.any(valid_proto):
+                continue
+            query_prototypes = query_prototypes[valid_proto]
+            query_weights = confounder_weights[query_idx][valid_proto]
+            if query_weights.numel() == 0 or query_weights.sum() <= 0:
+                continue
+            query_weights = query_weights / (query_weights.sum() + 1e-6)
+
+            proto_q = self.qk_attn_q_proj(query_prototypes)
+            proto_q_h = proto_q.contiguous().view(
+                query_weights.numel(), self.num_heads, self.q_dim // self.num_heads
+            ).permute(1, 0, 2)
+            proto_key_logits = torch.bmm(proto_q_h, k_content_h.transpose(1, 2)) * scale
+            proto_field = F.softmax(
+                proto_key_logits - proto_key_logits.max(dim=-1, keepdim=True)[0], dim=-1
+            )
+            proto_field = (proto_field * query_weights.view(1, -1, 1)).sum(dim=1)
+            proto_field = proto_field * position_support[:self.num_heads, query_idx, :]
+            proto_field = proto_field / (proto_field.mean(dim=-1, keepdim=True) + 1e-6)
+            proto_field = proto_field.clamp(max=5.0)
+
+            query_bias = -lambda_attn * sis[query_idx].clamp(min=0.0, max=1.0) * proto_field
+            query_bias = query_bias.clamp(min=-attn_clamp, max=0.0)
+            bias[:self.num_heads, query_idx, :] = query_bias.detach()
+
+        rgip_attn_context['attn_bias_abs_mean'] = bias.abs().mean().detach()
+        rgip_attn_context['modulated_pair_count'] = torch.as_tensor(
+            int(query_indices.numel()), device=device
+        )
+        return bias
 
 class TransformerDecoder(nn.Module):
 
@@ -239,14 +400,21 @@ class TransformerDecoder(nn.Module):
             q_pos: Optional[Tensor] = None,
             k_pos: Optional[Tensor] = None,
             return_cross_attn: bool = False,  # 新增参数
+            rgip_attn_context: Optional[dict] = None,
         ):
         # Add support for zero layers
         if self.num_layers == 0:
-            return queries.unsqueeze(0)
+            output = queries.unsqueeze(0)
+            if return_cross_attn:
+                return output, []
+            return output
         # Explicitly handle zero-size queries
         if queries.numel() == 0:
             rp = self.num_layers if self.return_intermediate else 1
-            return queries.unsqueeze(0).repeat(rp, 1, 1, 1)
+            output = queries.unsqueeze(0).repeat(rp, 1, 1, 1)
+            if return_cross_attn:
+                return output, []
+            return output
 
         output = queries
         intermediate = []
@@ -261,7 +429,8 @@ class TransformerDecoder(nn.Module):
                     q_padding_mask=q_padding_mask,
                     kv_padding_mask=kv_padding_mask,
                     q_pos=q_pos, k_pos=k_pos,
-                    return_cross_attn=True
+                    return_cross_attn=True,
+                    rgip_attn_context=rgip_attn_context
                 )
                 cross_attn_weights_list.append(cross_attn_weights)
             else:
@@ -271,7 +440,8 @@ class TransformerDecoder(nn.Module):
                     qk_attn_mask=qk_attn_mask,
                     q_padding_mask=q_padding_mask,
                     kv_padding_mask=kv_padding_mask,
-                    q_pos=q_pos, k_pos=k_pos
+                    q_pos=q_pos, k_pos=k_pos,
+                    rgip_attn_context=rgip_attn_context
                 )
             if self.return_intermediate:
                 intermediate.append(self.norm(output))

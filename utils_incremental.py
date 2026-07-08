@@ -11,6 +11,7 @@ import os
 import time
 import torch
 import pickle
+import json
 import numpy as np
 import scipy.io as sio
 import copy
@@ -35,6 +36,7 @@ from pocket.utils import DetectionAPMeter, BoxPairAssociation
 from ops import recover_boxes
 from detr.datasets import transforms as T
 import torch.nn.functional as F
+from inchoi.rgip_utils import RarityGuidedState
 
 def custom_collate(batch):
     images, targets, indices = [], [], []
@@ -203,23 +205,29 @@ class CustomisedDLE(DistributedLearningEngine):
     def __init__(self, net, train_dataloader, test_dataloader,
                  config, filter_classes=None, teacher_model=None,
                  replay_indices=None, mir_dict=None, rare_set=None,
-                 mir_min=0.0, mir_max=1.0):
+                 mir_min=0.0, mir_max=1.0,
+                 old_hoi_classes=None, current_hoi_classes=None,
+                 hoi_to_obj=None, hoi_to_verb=None, obj_verb_to_hoi=None,
+                 object_to_verb=None, hoi_frequency=None,
+                 task_idx=None, task_classes=None):
         super().__init__(
             net, None, train_dataloader,
             print_interval=config.print_interval,
-            cache_dir=config.output_dir,
+            cache_dir=getattr(config, 'checkpoint_dir', None) or config.output_dir,
             find_unused_parameters=True
         )
-        device = None
         self.config = config
         self.max_norm = config.clip_max_norm
         self.test_dataloader = test_dataloader
         self.filter_classes = filter_classes  # 仅评估这些类别
         self._rank = dist.get_rank()
-        self._device = torch.device(device) if device is not None else torch.device(self._rank)
+        self._device = torch.device(f'cuda:{self._rank}') if torch.cuda.is_available() else torch.device('cpu')
         self.teacher_model = teacher_model
         if self.teacher_model is not None:
-            self.teacher_model.cuda()
+            self.teacher_model.to(self._device)
+            self.teacher_model.eval()
+            for p in self.teacher_model.parameters():
+                p.requires_grad_(False)
             # self.teacher_model = torch.nn.parallel.DistributedDataParallel(
             #     self.teacher_model, device_ids=[self._device],
             #     find_unused_parameters=False
@@ -229,18 +237,68 @@ class CustomisedDLE(DistributedLearningEngine):
         self.rare_set = rare_set if rare_set is not None else set()
         self.mir_min = mir_min
         self.mir_max = mir_max
+        self.task_idx = task_idx
+        self.task_classes = task_classes
+        self.metrics_dir = getattr(config, 'metrics_dir', '') or os.path.join(config.output_dir, 'metrics')
+        self.analysis_dir = getattr(config, 'analysis_dir', '') or os.path.join(config.output_dir, 'analysis')
+        self.best_perf = float('-inf')
+        self._wandb_started = False
+        if self._rank == 0:
+            os.makedirs(self.metrics_dir, exist_ok=True)
+            os.makedirs(self.analysis_dir, exist_ok=True)
+        self.rgip_state = None
+        self.latest_rgip_stats = {}
+        if getattr(config, 'use_rgip', False):
+            self.rgip_state = RarityGuidedState(
+                num_verbs=getattr(config, 'num_verbs', 117),
+                hoi_to_obj=hoi_to_obj,
+                hoi_to_verb=hoi_to_verb,
+                obj_verb_to_hoi=obj_verb_to_hoi,
+                object_to_verb=object_to_verb,
+                old_hoi_classes=old_hoi_classes,
+                current_hoi_classes=current_hoi_classes,
+                args=config,
+                device=self._device,
+                hoi_frequency=hoi_frequency,
+            )
+            if getattr(config, 'rgip_debug', False) and self._rank == 0:
+                print("[RGIP] Prototype bank uses local per-rank EMA updates.", flush=True)
+
+    def _is_valid_batch(self, batch):
+        return batch is not None and len(batch) > 0 and batch[0] is not None
+
+    def _all_ranks_have_valid_batch(self, batch, stage="batch"):
+        """Synchronise empty-batch skipping across DDP ranks.
+
+        custom_collate can return (None, None, None) when every sample in a
+        local mini-batch is filtered out. In DDP, one rank skipping alone while
+        the others enter forward/all_gather/backward desynchronises NCCL and can
+        deadlock. Therefore every rank first shares a tiny validity flag; if any
+        rank is empty, all ranks skip this step together.
+        """
+        local_valid = 1 if self._is_valid_batch(batch) else 0
+        if dist.is_available() and dist.is_initialized() and self._world_size > 1:
+            flag = torch.tensor([local_valid], dtype=torch.int32, device=self._device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+            all_valid = bool(flag.item())
+            if not all_valid and self._rank == 0:
+                print(f"=> DDP: Skipping {stage} because at least one rank received an empty batch.", flush=True)
+            return all_valid
+        if not local_valid:
+            print(f"=> Rank {self._rank}: Skipping empty {stage}.", flush=True)
+        return bool(local_valid)
 
     def __call__(self, n: int) -> None:
         self.epochs = n
         # Train for a specified number of epochs
         self._on_start()
-        for _ in range(n):
+        start_epoch = int(getattr(self._state, 'epoch', 0) or 0)
+        for _ in range(max(0, int(n) - start_epoch)):
             self._on_start_epoch()
 
             timestamp = time.time()
             for batch in self._train_loader:
-                if batch is None or batch[0] is None:
-                    print(f"=> Rank {self._rank}: Skipping empty batch.")
+                if not self._all_ranks_have_valid_batch(batch, stage="training batch"):
                     continue
                 self._state.inputs = batch[0]  # images
                 self._state.targets = batch[1] # targets
@@ -260,6 +318,10 @@ class CustomisedDLE(DistributedLearningEngine):
         self._on_end()
 
     def _on_start(self):
+        if getattr(self.config, 'skip_initial_eval', False):
+            if self._rank == 0:
+                print("[Train] Skipping initial evaluation before training.", flush=True)
+            return
         if self._train_loader.dataset.name == "hicodet":
             ap = self.test_hico()
             trained_classes = self.filter_classes  # 仅评估这些类别
@@ -279,6 +341,7 @@ class CustomisedDLE(DistributedLearningEngine):
                 )
                 self.best_perf = perf[0]
                 wandb.init(config=self.config)
+                self._wandb_started = True
                 wandb.watch(self._state.net.module)
                 wandb.define_metric("epochs")
                 wandb.define_metric("mAP full", step_metric="epochs", summary="max")
@@ -306,13 +369,19 @@ class CustomisedDLE(DistributedLearningEngine):
                 NOTE wandb was not setup for V-COCO as the dataset was only used for evaluation
                 """
                 wandb.init(config=self.config)
+                self._wandb_started = True
 
     def _on_end(self):
-        if self._rank == 0:
+        if self._rank == 0 and self._wandb_started:
             wandb.finish()
 
     def _on_each_iteration(self):
-        torch.autograd.set_detect_anomaly(True)
+        if getattr(self.config, 'use_rgip', False):
+            self._on_each_iteration_rgip()
+            return
+
+        if getattr(self.config, 'detect_anomaly', False):
+            torch.autograd.set_detect_anomaly(True)
             # 跳过无效batch
         if self._state.inputs is None or self._state.targets is None or len(self._state.targets) == 0:
             print("无有效HOI标注，跳过该batch")
@@ -392,6 +461,8 @@ class CustomisedDLE(DistributedLearningEngine):
         if self.config.use_distill and self.config.replay_distill and teacher_outputs is not None:
             images, targets, batch_indices = self._state.inputs, self._state.targets, self._state.batch_indices
             key = self.config.replay_distill_layer
+            if key == 'logits':
+                key = 'pred_logits'
 
             if batch_indices is not None and key in ['pred_logits', 'feat']:
                 # 筛 pair 时，获取全局唯一标识 (Global Image Index, Pair Index in Image)
@@ -479,7 +550,7 @@ class CustomisedDLE(DistributedLearningEngine):
             print("当前损失:", loss_dict)
             if total_loss.isnan() or total_loss.isinf():
                 print("standard_distill_loss:", standard_distill_loss)
-                print("replay_distill_loss:", replay_distill_loss)
+                print("feature_distill_loss:", feature_distill_loss)
             self._state.loss = None  # 明确标记无效
             return
             #raise ValueError(f"The HOI loss is NaN or Inf for rank {self._rank}")
@@ -490,6 +561,376 @@ class CustomisedDLE(DistributedLearningEngine):
         if self.max_norm > 0:
             torch.nn.utils.clip_grad_norm_(self._state.net.parameters(), self.max_norm)
         self._state.optimizer.step()
+
+    @staticmethod
+    def _output_pair_ids(output):
+        global_indices = output.get('pair_global_indices')
+        local_indices = output.get('pair_idx_in_image')
+        if global_indices is None or local_indices is None:
+            return []
+        return [(int(g), int(p)) for g, p in zip(global_indices.tolist(), local_indices.tolist())]
+
+    def _compute_replay_distill_loss(self, outputs, teacher_outputs, batch_indices, targets):
+        """Optional standard replay-distill loss used to strengthen RGIP variants.
+
+        The original non-RGIP path returns early when use_rgip=True, so enabling
+        --use-rgip together with --use-distill previously ignored the strong
+        replay-distill baseline.  This helper mirrors that baseline in a
+        defensive way and lets RGIP be trained as an add-on instead of a weaker
+        replacement.
+        """
+        zero = outputs['cls_loss'].new_zeros(())
+        stats = {}
+        if teacher_outputs is None or not getattr(self.config, 'use_distill', False):
+            return zero, stats
+
+        total = zero.clone()
+        if 'cls_loss' in outputs and 'cls_loss' in teacher_outputs:
+            cls_kd = F.mse_loss(outputs['cls_loss'], teacher_outputs['cls_loss'].detach())
+            cls_kd = cls_kd * float(getattr(self.config, 'distill_loss_weight', 1.0))
+            total = total + cls_kd
+            stats['distill/cls_loss'] = float(cls_kd.detach().cpu())
+
+        if not getattr(self.config, 'replay_distill', False):
+            return total, stats
+
+        key = getattr(self.config, 'replay_distill_layer', 'logits')
+        if key == 'logits':
+            key = 'pred_logits'
+        if key not in ['pred_logits', 'feat']:
+            return total, stats
+        if 'pred_logits' not in outputs or 'pred_logits' not in teacher_outputs:
+            return total, stats
+        if outputs['pred_logits'].shape[0] == 0 or teacher_outputs['pred_logits'].shape[0] == 0:
+            return total, stats
+
+        student_ids = self._output_pair_ids(outputs)
+        teacher_ids = self._output_pair_ids(teacher_outputs)
+        if not student_ids or not teacher_ids:
+            return total, stats
+
+        student_id2idx = {pid: i for i, pid in enumerate(student_ids)}
+        teacher_id2idx = {pid: i for i, pid in enumerate(teacher_ids)}
+        common_ids = sorted(set(student_id2idx) & set(teacher_id2idx))
+        if not common_ids:
+            return total, stats
+
+        student_indices = [student_id2idx[pid] for pid in common_ids]
+        teacher_indices = [teacher_id2idx[pid] for pid in common_ids]
+        max_student = min(outputs['feat'].shape[0], outputs['pred_logits'][-1].shape[0])
+        max_teacher = min(teacher_outputs['feat'].shape[0], teacher_outputs['pred_logits'][-1].shape[0])
+        aligned = [
+            (si, ti)
+            for si, ti in zip(student_indices, teacher_indices)
+            if si < max_student and ti < max_teacher
+        ]
+        if not aligned:
+            return total, stats
+        student_indices, teacher_indices = zip(*aligned)
+        student_indices = list(student_indices)
+        teacher_indices = list(teacher_indices)
+
+        student_feat = outputs['feat'][student_indices]
+        teacher_feat = teacher_outputs['feat'][teacher_indices].detach().to(student_feat.device)
+        student_logits = outputs['pred_logits'][-1][student_indices]
+        teacher_logits = teacher_outputs['pred_logits'][-1][teacher_indices].detach().to(student_logits.device)
+        if student_feat.shape != teacher_feat.shape or student_logits.shape != teacher_logits.shape:
+            return total, stats
+
+        weight_value = float(getattr(self.config, 'replay_distill_loss_weight', 1.0))
+        weights = torch.full(
+            (len(student_indices),),
+            weight_value,
+            dtype=student_feat.dtype,
+            device=student_feat.device,
+        )
+
+        # Keep the old rare/MIR weighting when the metadata is available, but
+        # fall back to uniform weights if labels are ambiguous.
+        try:
+            pair_image_indices = outputs.get('pair_image_indices')
+            if pair_image_indices is not None:
+                all_pair_labels = [
+                    targets[int(pair_image_indices[i])]['labels'][0].item()
+                    if targets[int(pair_image_indices[i])]['labels'].numel() > 0 else -1
+                    for i in range(len(pair_image_indices))
+                ]
+                weighted = []
+                for si in student_indices:
+                    cls = int(all_pair_labels[si]) if si < len(all_pair_labels) else -1
+                    mir_score = float(self.mir_dict.get(str(cls), 0.0))
+                    if self.mir_max > self.mir_min:
+                        mir_score = (mir_score - self.mir_min) / (self.mir_max - self.mir_min + 1e-6)
+                    else:
+                        mir_score = 0.0
+                    is_rare = 1 if cls in self.rare_set else 0
+                    w = weight_value * (
+                        1
+                        + float(getattr(self.config, 'replay_distill_mir_factor', 0.0)) * mir_score
+                        + float(getattr(self.config, 'replay_distill_rare_factor', 0.0)) * is_rare
+                    )
+                    weighted.append(w)
+                weights = torch.tensor(weighted, dtype=student_feat.dtype, device=student_feat.device)
+        except Exception:
+            pass
+
+        feat_distill = F.mse_loss(student_feat, teacher_feat, reduction='none').mean(dim=1)
+        logits_distill = F.mse_loss(student_logits, teacher_logits, reduction='none').mean(dim=1)
+        final_feat_loss = (feat_distill * weights).mean()
+        final_logits_loss = (logits_distill * weights).mean()
+        if key == 'pred_logits':
+            replay_kd = final_feat_loss + 0.5 * final_logits_loss
+        else:
+            replay_kd = final_feat_loss
+
+        total = total + replay_kd
+        stats['distill/replay_feat_loss'] = float(final_feat_loss.detach().cpu())
+        stats['distill/replay_logit_loss'] = float(final_logits_loss.detach().cpu())
+        stats['distill/replay_loss'] = float(replay_kd.detach().cpu())
+        stats['distill/common_pairs'] = len(student_indices)
+        return total, stats
+
+    def _on_each_iteration_rgip(self):
+        if getattr(self.config, 'detect_anomaly', False):
+            torch.autograd.set_detect_anomaly(True)
+        if self._state.inputs is None or self._state.targets is None or len(self._state.targets) == 0:
+            print("无有效HOI标注，跳过该batch")
+            return
+
+        timing_enabled = bool(getattr(self.config, 'rgip_timing', False)) and self._rank == 0
+        timing_start = time.time()
+        timing_last = timing_start
+
+        def mark_timing(name):
+            nonlocal timing_last
+            if not timing_enabled:
+                return
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            now = time.time()
+            print(
+                f"[RGIP_TIMING] task={self.task_idx} epoch={self._state.epoch} "
+                f"iter={self._state.iteration} {name}: "
+                f"delta={now - timing_last:.3f}s total={now - timing_start:.3f}s",
+                flush=True
+            )
+            timing_last = now
+
+        mark_timing('start')
+
+        images = self._state.inputs
+        targets = self._state.targets
+        batch_indices = self._state.batch_indices
+        replay_mask = [int(idx) in self.replay_indices for idx in batch_indices]
+
+        teacher_replay_output = None
+        teacher_all_output = None
+        replay_context = None
+        rgip_context = None
+        rgip_stats = {}
+
+        use_standard_distill = (
+            self.teacher_model is not None
+            and getattr(self.config, 'use_distill', False)
+            and getattr(self.config, 'replay_distill', False)
+        )
+        if use_standard_distill:
+            with torch.no_grad():
+                self.teacher_model.train()
+                teacher_all_output = self.teacher_model(
+                    images,
+                    targets=targets,
+                    return_outputs=True,
+                    batch_indices=batch_indices,
+                    return_rgip_meta=True,
+                )
+                self.teacher_model.eval()
+            mark_timing('teacher_all_forward')
+
+        if self.teacher_model is not None and any(replay_mask):
+            replay_images = [img for img, flag in zip(images, replay_mask) if flag]
+            replay_targets = [tar for tar, flag in zip(targets, replay_mask) if flag]
+            selected_indices = [int(idx) for idx, flag in zip(batch_indices, replay_mask) if flag]
+            if len(replay_images) > 0:
+                if teacher_all_output is not None:
+                    teacher_replay_output = teacher_all_output
+                else:
+                    self.teacher_model.eval()
+                    with torch.no_grad():
+                        teacher_replay_output = self.teacher_model(
+                            replay_images,
+                            targets=replay_targets,
+                            return_outputs=True,
+                            batch_indices=selected_indices,
+                            return_rgip_meta=True,
+                        )
+                    mark_timing('teacher_replay_forward')
+                replay_context = self.rgip_state.build_replay_pair_context(
+                    teacher_replay_output,
+                    selected_global_indices=selected_indices,
+                )
+                rgip_context = self.rgip_state.build_student_batch_context(
+                    replay_context,
+                    batch_indices=batch_indices,
+                )
+                rgip_stats.update(self.rgip_state.last_stats)
+                mark_timing('build_rgip_context')
+
+        outputs = self._state.net(
+            images,
+            targets=targets,
+            return_outputs=True,
+            batch_indices=batch_indices,
+            rgip_context=rgip_context,
+            return_rgip_meta=True,
+        )
+        mark_timing('student_forward')
+        if rgip_context:
+            bias_values = []
+            modulated_pairs = 0
+            student_query_counts = []
+            context_mask_counts = []
+            prepared_mask_counts = []
+            fallback_counts = []
+            for ctx in rgip_context.values():
+                if 'attn_bias_abs_mean' in ctx:
+                    bias_values.append(float(ctx['attn_bias_abs_mean'].detach().cpu()))
+                if 'modulated_pair_count' in ctx:
+                    modulated_pairs += int(ctx['modulated_pair_count'].detach().cpu())
+                if 'student_query_count' in ctx:
+                    student_query_counts.append(float(ctx['student_query_count'].detach().cpu()))
+                if 'attn_context_mask_count' in ctx:
+                    context_mask_counts.append(float(ctx['attn_context_mask_count'].detach().cpu()))
+                if 'prepared_attn_mask_count' in ctx:
+                    prepared_mask_counts.append(float(ctx['prepared_attn_mask_count'].detach().cpu()))
+                if '_rgip_attn_alignment_fallback' in ctx:
+                    fallback_counts.append(float(ctx['_rgip_attn_alignment_fallback'].detach().cpu()))
+            if bias_values:
+                rgip_stats['rgip/attn_bias_abs_mean'] = float(np.mean(bias_values))
+            rgip_stats['rgip/modulated_pair_count'] = modulated_pairs
+            if student_query_counts:
+                rgip_stats['rgip/student_query_count_mean'] = float(np.mean(student_query_counts))
+            if context_mask_counts:
+                rgip_stats['rgip/attn_context_mask_count'] = float(np.sum(context_mask_counts))
+            if prepared_mask_counts:
+                rgip_stats['rgip/prepared_attn_mask_count'] = float(np.sum(prepared_mask_counts))
+            if fallback_counts:
+                rgip_stats['rgip/attn_alignment_fallback'] = float(np.sum(fallback_counts))
+
+        output_attn_stats = outputs.get('rgip_attn_stats', None) if isinstance(outputs, dict) else None
+        if output_attn_stats:
+            hit_images = int(output_attn_stats.get('hit_images', 0) or 0)
+            rgip_stats['rgip/attn_context_hit_images'] = hit_images
+            rgip_stats['rgip/modulated_pair_count'] = int(
+                output_attn_stats.get('modulated_pair_count', 0) or 0
+            )
+            rgip_stats['rgip/attn_context_mask_count'] = int(
+                output_attn_stats.get('context_mask_count', 0) or 0
+            )
+            rgip_stats['rgip/prepared_attn_mask_count'] = int(
+                output_attn_stats.get('prepared_attn_mask_count', 0) or 0
+            )
+            rgip_stats['rgip/attn_alignment_fallback'] = int(
+                output_attn_stats.get('attn_alignment_fallback', 0) or 0
+            )
+            if hit_images > 0:
+                rgip_stats['rgip/student_query_count_mean'] = float(
+                    output_attn_stats.get('student_query_count_sum', 0) / max(hit_images, 1)
+                )
+            bias_count = int(output_attn_stats.get('attn_bias_count', 0) or 0)
+            if bias_count > 0:
+                rgip_stats['rgip/attn_bias_abs_mean'] = float(
+                    output_attn_stats.get('attn_bias_abs_sum', 0.0) / bias_count
+                )
+
+        cls_loss = outputs['cls_loss']
+        rgip_int_loss = torch.zeros((), device=cls_loss.device, dtype=cls_loss.dtype)
+        if teacher_replay_output is not None and replay_context:
+            rgip_int_loss, int_stats = self.rgip_state.compute_interaction_distillation(
+                student_output=outputs,
+                teacher_output=teacher_replay_output,
+                replay_context=rgip_context,
+            )
+            rgip_stats.update(int_stats)
+            mark_timing('interaction_distill')
+
+        replay_distill_loss = torch.zeros((), device=cls_loss.device, dtype=cls_loss.dtype)
+        if teacher_all_output is not None:
+            replay_distill_loss, distill_stats = self._compute_replay_distill_loss(
+                outputs=outputs,
+                teacher_outputs=teacher_all_output,
+                batch_indices=batch_indices,
+                targets=targets,
+            )
+            rgip_stats.update(distill_stats)
+            mark_timing('replay_distill')
+
+        total_loss = (
+            cls_loss
+            + float(getattr(self.config, 'rgip_int_loss_weight', 1.0)) * rgip_int_loss
+            + replay_distill_loss
+        )
+
+        if cls_loss.isnan() or cls_loss.isinf() or total_loss.isnan() or total_loss.isinf():
+            print("当前损失:", {
+                'cls_loss': cls_loss,
+                'rgip_int_loss': rgip_int_loss,
+                'replay_distill_loss': replay_distill_loss,
+            })
+            self._state.loss = None
+            return
+
+        self._state.loss = total_loss
+        self._state.optimizer.zero_grad(set_to_none=True)
+        self._state.loss.backward()
+        mark_timing('backward')
+        if self.max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self._state.net.parameters(), self.max_norm)
+        self._state.optimizer.step()
+        mark_timing('optimizer_step')
+
+        self.rgip_state.update_current_task_prototypes(outputs)
+        mark_timing('update_prototypes')
+
+        if getattr(self.config, 'rgip_debug', False) and self._rank == 0:
+            if self._state.iteration % max(int(getattr(self.config, 'print_interval', 1)), 1) == 0:
+                rgip_stats.setdefault('rgip/int_loss', float(rgip_int_loss.detach().cpu()))
+                rgip_stats.setdefault('rgip/prototype_count', len(self.rgip_state.prototypes))
+                self.latest_rgip_stats = dict(rgip_stats)
+                self.latest_rgip_stats.update({
+                    'task_idx': self.task_idx,
+                    'epoch': int(self._state.epoch),
+                    'iteration': int(self._state.iteration),
+                    'loss': float(total_loss.detach().cpu()),
+                })
+                self._append_jsonl(
+                    os.path.join(self.metrics_dir, 'rgip_iteration_stats.jsonl'),
+                    self.latest_rgip_stats
+                )
+                stat_msg = ', '.join(
+                    f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}"
+                    for k, v in sorted(rgip_stats.items())
+                )
+                print(f"[RGIP] {stat_msg}", flush=True)
+
+    @staticmethod
+    def _json_default(obj):
+        if isinstance(obj, torch.Tensor):
+            if obj.numel() == 1:
+                return obj.item()
+            return obj.detach().cpu().tolist()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, set):
+            return sorted(obj)
+        return str(obj)
+
+    def _append_jsonl(self, path, item):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(item, ensure_ascii=False, default=self._json_default) + '\n')
 
     def _print_statistics(self):
         running_loss = self._state.running_loss.mean()
@@ -535,6 +976,20 @@ class CustomisedDLE(DistributedLearningEngine):
                     f"Epoch {self._state.epoch} =>\t"
                     f"mAP: {perf[0]:.4f}, rare: {perf[1]:.4f}, none-rare: {perf[2]:.4f}."
                 )
+                self._append_jsonl(
+                    os.path.join(self.metrics_dir, 'epoch_metrics.jsonl'),
+                    {
+                        'task_idx': self.task_idx,
+                        'task_classes': self.task_classes,
+                        'epoch': int(self._state.epoch),
+                        'iteration': int(self._state.iteration),
+                        'mAP': perf[0],
+                        'rare_mAP': perf[1],
+                        'non_rare_mAP': perf[2],
+                        'best_mAP_before_update': float(getattr(self, 'best_perf', 0.0)),
+                        'rgip_latest': self.latest_rgip_stats,
+                    }
+                )
                 # wandb.log({
                 #     "epochs": self._state.epoch, "mAP full": perf[0],
                 #     "mAP rare": perf[1], "mAP non_rare": perf[2]
@@ -546,6 +1001,16 @@ class CustomisedDLE(DistributedLearningEngine):
                 print(
                     f"Epoch {self._state.epoch} =>\t"
                     f"mAP: {perf[0]:.4f}."
+                )
+                self._append_jsonl(
+                    os.path.join(self.metrics_dir, 'epoch_metrics.jsonl'),
+                    {
+                        'task_idx': self.task_idx,
+                        'task_classes': self.task_classes,
+                        'epoch': int(self._state.epoch),
+                        'iteration': int(self._state.iteration),
+                        'mAP': perf[0],
+                    }
                 )
                 """
                 NOTE wandb was not setup for V-COCO as the dataset was only used for evaluation
@@ -597,8 +1062,7 @@ class CustomisedDLE(DistributedLearningEngine):
         per_sample_scores = []  # 新增
         print("testing hico...")
         for batch_idx, batch in enumerate(dataloader):
-            if batch is None or batch[0] is None:
-                print("[def test_hico]:无有效HOI标注，跳过该batch")
+            if not self._all_ranks_have_valid_batch(batch, stage="HICO eval batch"):
                 continue
             images, targets, batch_indices = batch
             images = pocket.ops.relocate_to_cuda(images)
@@ -653,7 +1117,7 @@ class CustomisedDLE(DistributedLearningEngine):
                         prob = scores.max().item()
                     sample_scores[gt] = prob
                 per_sample_scores.append({
-                    'local_idx': batch_idx * dataloader.batch_size + i,
+                    'local_idx': int(batch_indices[i]) if batch_indices is not None else batch_idx * dataloader.batch_size + i,
                     'gt_classes': [int(g.item()) for g in gt_classes],
                     'scores': sample_scores
                 })
@@ -671,6 +1135,14 @@ class CustomisedDLE(DistributedLearningEngine):
                 meter.append(torch.cat(scores_ddp), torch.cat(preds_ddp), torch.cat(labels_ddp))
 
         if return_per_sample_scores:
+            if dist.is_initialized():
+                gathered_scores = [None for _ in range(dist.get_world_size())]
+                dist.all_gather_object(gathered_scores, per_sample_scores)
+                if self._rank == 0:
+                    per_sample_scores = [
+                        item for rank_scores in gathered_scores if rank_scores is not None
+                        for item in rank_scores
+                    ]
             if self._rank == 0:
                 ap = meter.eval()
                 ap_trained = ap[trained_classes]
@@ -780,6 +1252,8 @@ class CustomisedDLE(DistributedLearningEngine):
                 num_gt=dataset.num_instances,
             )
         for batch in tqdm(dataloader, disable=(self._world_size != 1)):
+            if not self._all_ranks_have_valid_batch(batch, stage="V-COCO eval batch"):
+                continue
             inputs = pocket.ops.relocate_to_cuda(batch[:-1])
             outputs = net(*inputs)
             outputs = pocket.ops.relocate_to_cpu(outputs, ignore=True)

@@ -247,31 +247,124 @@ class PViC(nn.Module):
     def freeze_detector(self):
         for p in self.detector.parameters():
             p.requires_grad = False
+        self.detector.eval()
 
-    def compute_classification_loss(self, logits, prior, labels):
+    @staticmethod
+    def _prepare_rgip_attn_context(ctx, n_queries):
+        """Return a decoder-safe RGIP attention context.
+
+        The teacher builds replay contexts in its own pair order, while the
+        student decoder can occasionally see fewer/differently ordered HO
+        queries.  If all modulated pairs fall outside the student's available
+        query range, attention modulation silently becomes a no-op.  For the
+        attention branch only, pack the highest-SIS valid confounder entries
+        into the available query slots; the original context is still used for
+        loss weighting/distillation.
+        """
+        if ctx is None or n_queries is None or n_queries <= 0:
+            return ctx
+        modulate_mask = ctx.get('modulate_mask', None)
+        if modulate_mask is None or modulate_mask.numel() == 0:
+            return ctx
+
+        max_attn_pairs = int(ctx.get('max_attn_pairs', 16) or 16)
+        max_attn_pairs = max(1, max_attn_pairs)
+
+        n_ctx = min(int(n_queries), int(modulate_mask.shape[0]))
+        if n_ctx > 0 and bool(modulate_mask[:n_ctx].any().item()):
+            valid_in_range = torch.nonzero(modulate_mask[:n_ctx], as_tuple=False).flatten()
+            if valid_in_range.numel() > max_attn_pairs:
+                sis = ctx.get('sis', None)
+                if sis is not None and sis.numel() > 0:
+                    valid_sis = sis[valid_in_range].to(dtype=torch.float32)
+                    order = torch.argsort(valid_sis, descending=True)
+                    valid_in_range = valid_in_range[order]
+                selected = valid_in_range[:max_attn_pairs]
+                limited = dict(ctx)
+                limited_mask = modulate_mask.clone()
+                limited_mask[:n_ctx] = False
+                limited_mask[selected] = True
+                limited['modulate_mask'] = limited_mask
+                limited['max_attn_pairs'] = max_attn_pairs
+                limited['_rgip_attn_alignment_fallback'] = torch.zeros(
+                    (), device=modulate_mask.device, dtype=torch.long
+                )
+                return limited
+            ctx['_rgip_attn_alignment_fallback'] = torch.zeros(
+                (), device=modulate_mask.device, dtype=torch.long
+            )
+            return ctx
+
+        valid = torch.nonzero(modulate_mask, as_tuple=False).flatten()
+        if valid.numel() == 0:
+            return ctx
+
+        sis = ctx.get('sis', None)
+        if sis is not None and sis.numel() > 0:
+            valid_sis = sis[valid].to(dtype=torch.float32)
+            order = torch.argsort(valid_sis, descending=True)
+            valid = valid[order]
+
+        k = min(int(n_queries), int(valid.numel()), max_attn_pairs)
+        selected = valid[:k]
+        aligned = {
+            'lambda_attn': ctx.get('lambda_attn', 0.0),
+            'kappa': ctx.get('kappa', 1.0),
+            'attn_clamp': ctx.get('attn_clamp', 5.0),
+            'max_attn_pairs': max_attn_pairs,
+            '_rgip_attn_alignment_fallback': torch.ones(
+                (), device=modulate_mask.device, dtype=torch.long
+            ),
+        }
+        for key in ('sis', 'confounder_weights', 'confounder_prototypes'):
+            src = ctx.get(key, None)
+            if src is None:
+                continue
+            shape = list(src.shape)
+            shape[0] = k
+            dst = torch.zeros(shape, device=src.device, dtype=src.dtype)
+            dst[:k] = src[selected]
+            aligned[key] = dst
+
+        aligned_mask = torch.zeros(k, device=modulate_mask.device, dtype=torch.bool)
+        aligned_mask[:k] = True
+        aligned['modulate_mask'] = aligned_mask
+        return aligned
+
+    def compute_classification_loss(self, logits, prior, labels, pair_weights=None):
         prior = torch.cat(prior, dim=0).prod(1)
         x, y = torch.nonzero(prior).unbind(1)
 
         logits = logits[:, x, y]
         prior = prior[x, y]
         labels = labels[None, x, y].repeat(len(logits), 1)
+        valid_weights = None
+        if pair_weights is not None and len(x) > 0:
+            valid_weights = pair_weights.to(device=logits.device, dtype=logits.dtype)[x]
 
-        n_p = labels.sum()
-        if dist.is_initialized():
+        if valid_weights is not None:
+            n_p = (labels * valid_weights[None, :]).sum()
+        else:
+            n_p = labels.sum()
+        if self.training and dist.is_initialized():
             world_size = dist.get_world_size()
-            n_p = torch.as_tensor([n_p], device='cuda')
+            n_p = n_p.detach().reshape(1).to(logits.device)
             dist.barrier()
             dist.all_reduce(n_p)
-            n_p = (n_p / world_size).item()
+            n_p = (n_p / world_size).clamp(min=1.0).item()
+        else:
+            n_p = n_p.clamp(min=1.0)
 
         loss = binary_focal_loss_with_logits(
             torch.log(
                 prior / (1 + torch.exp(-logits) - prior) + 1e-8
-            ), labels, reduction='sum',
+            ), labels, reduction='none',
             alpha=self.alpha, gamma=self.gamma
         )
+        if valid_weights is not None:
+            loss = loss * valid_weights[None, :]
 
-        return loss / n_p
+        return loss.sum() / n_p
 
     def postprocessing(self,
             boxes, paired_inds, object_types,
@@ -407,7 +500,10 @@ class PViC(nn.Module):
         return_outputs=False,
         teacher_cross_attn_hint=None,
         attn_hint_alpha=0.05,
-        use_vas=False, is_replay_list=None, sis_scores=None, vas_lambda=0.0) -> List[dict]:
+        use_vas=False, is_replay_list=None, sis_scores=None, vas_lambda=0.0,
+        batch_indices=None,
+        rgip_context=None,
+        return_rgip_meta=False) -> List[dict]:
         """
         Parameters:
         -----------
@@ -441,6 +537,11 @@ class PViC(nn.Module):
         image_sizes = torch.as_tensor([im.size()[-2:] for im in images], device=images[0].device)
 
         with torch.no_grad():
+            # The detector is frozen in PViC training.  Keep it in eval mode even
+            # when the surrounding DDP module calls train(), otherwise dropout in
+            # the detector can make teacher/student HO-pair ordering diverge and
+            # disable RGIP attention modulation.
+            self.detector.eval()
             results, hs, features = self.od_forward(self.detector, images)
             results = self.postprocessor(results, image_sizes)
 
@@ -467,6 +568,16 @@ class PViC(nn.Module):
         # Enhance visual context with triplet decoder.
         query_embeds = [None] * len(ho_queries)
         cross_attn_weights_list = [None] * len(ho_queries)
+        rgip_attn_stats = {
+            'hit_images': 0,
+            'student_query_count_sum': 0,
+            'context_mask_count': 0,
+            'prepared_attn_mask_count': 0,
+            'modulated_pair_count': 0,
+            'attn_alignment_fallback': 0,
+            'attn_bias_abs_sum': 0.0,
+            'attn_bias_count': 0,
+        }
         if use_vas and is_replay_list is not None and True in is_replay_list and False in is_replay_list:
             # === 开启 VAS 模式 (Batch中同时包含新旧样本) ===
             print(f"[Debug] VAS Triggered! New samples: {is_replay_list.count(False)}, Old samples: {is_replay_list.count(True)}", flush=True)
@@ -484,13 +595,17 @@ class PViC(nn.Module):
                 query_embeds[i] = out.squeeze(dim=2)
                 cross_attn_weights_list[i] = cw
 
-                # 提取单张图片的注意力矩阵 [1, heads, num_queries, h*w]
-                cw_last_layer = cw[-1] if isinstance(cw, list) else cw
-
-                # ✅ 关键修复：先在内部沿着 batch(0), heads(1), queries(2) 维度求平均
-                # 将形状从 [1, 8, num_queries, 1050] 降维成 [1050] 的纯空间分布
-                spatial_map = cw_last_layer.detach().mean(dim=(0, 1, 2))
-                new_attns.append(spatial_map)
+                # 提取单张图片的注意力矩阵 [1, heads, num_queries, h*w]。
+                # 0 query 图片不会产生有效 cross-attention，直接跳过即可。
+                if isinstance(cw, list):
+                    cw_last_layer = cw[-1] if len(cw) > 0 else None
+                else:
+                    cw_last_layer = cw
+                if cw_last_layer is not None and cw_last_layer.numel() > 0:
+                    # ✅ 关键修复：先在内部沿着 batch(0), heads(1), queries(2) 维度求平均
+                    # 将形状从 [1, 8, num_queries, 1050] 降维成 [1050] 的纯空间分布
+                    spatial_map = cw_last_layer.detach().mean(dim=(0, 1, 2))
+                    new_attns.append(spatial_map)
 
             # 计算 M_dist (干涉源分布)
             if len(new_attns) > 0:
@@ -526,10 +641,73 @@ class PViC(nn.Module):
                 cross_attn_weights_list[i] = cw
         else:
             for i, (ho_q, mem) in enumerate(zip(ho_queries, memory)):
+                global_idx = int(batch_indices[i]) if batch_indices is not None else i
+                image_rgip_context = None
+                decoder_rgip_context = None
+                if rgip_context is not None:
+                    image_rgip_context = rgip_context.get(global_idx, None)
+                    if image_rgip_context is None:
+                        image_rgip_context = rgip_context.get(str(global_idx), None)
+                    if image_rgip_context is None and len(rgip_context) == 1 and len(ho_queries) == 1:
+                        image_rgip_context = next(iter(rgip_context.values()))
+                    decoder_rgip_context = self._prepare_rgip_attn_context(
+                        image_rgip_context, int(ho_q.shape[0])
+                    )
+                    if image_rgip_context is not None:
+                        rgip_attn_stats['hit_images'] += 1
+                        rgip_attn_stats['student_query_count_sum'] += int(ho_q.shape[0])
+                        image_rgip_context['student_query_count'] = torch.as_tensor(
+                            int(ho_q.shape[0]), device=ho_q.device
+                        )
+                        raw_mask = image_rgip_context.get('modulate_mask', None)
+                        if raw_mask is not None:
+                            rgip_attn_stats['context_mask_count'] += int(raw_mask.sum().detach().cpu())
+                        image_rgip_context['attn_context_mask_count'] = torch.as_tensor(
+                            0, device=ho_q.device
+                        ) if raw_mask is None else raw_mask.sum().detach().to(device=ho_q.device)
+                        prepared_mask = (
+                            decoder_rgip_context.get('modulate_mask', None)
+                            if decoder_rgip_context is not None else None
+                        )
+                        if prepared_mask is not None:
+                            rgip_attn_stats['prepared_attn_mask_count'] += int(
+                                prepared_mask.sum().detach().cpu()
+                            )
+                        image_rgip_context['prepared_attn_mask_count'] = torch.as_tensor(
+                            0, device=ho_q.device
+                        ) if prepared_mask is None else prepared_mask.sum().detach().to(
+                            device=ho_q.device
+                        )
                 out, cross_attn_weights = self.decoder(
                     ho_q.unsqueeze(1), mem.unsqueeze(1), kv_padding_mask=kv_p_m[i],
-                    q_pos=positional_embeds[i], k_pos=k_pos[i], return_cross_attn=True
+                    q_pos=positional_embeds[i], k_pos=k_pos[i], return_cross_attn=True,
+                    rgip_attn_context=decoder_rgip_context
                 )
+                if (
+                    image_rgip_context is not None and decoder_rgip_context is not None
+                    and decoder_rgip_context is not image_rgip_context
+                ):
+                    for stat_key in (
+                        'attn_bias_abs_mean',
+                        'modulated_pair_count',
+                        '_rgip_attn_alignment_fallback',
+                    ):
+                        if stat_key in decoder_rgip_context:
+                            image_rgip_context[stat_key] = decoder_rgip_context[stat_key]
+                if decoder_rgip_context is not None:
+                    if 'modulated_pair_count' in decoder_rgip_context:
+                        rgip_attn_stats['modulated_pair_count'] += int(
+                            decoder_rgip_context['modulated_pair_count'].detach().cpu()
+                        )
+                    if 'attn_bias_abs_mean' in decoder_rgip_context:
+                        rgip_attn_stats['attn_bias_abs_sum'] += float(
+                            decoder_rgip_context['attn_bias_abs_mean'].detach().cpu()
+                        )
+                        rgip_attn_stats['attn_bias_count'] += 1
+                    if '_rgip_attn_alignment_fallback' in decoder_rgip_context:
+                        rgip_attn_stats['attn_alignment_fallback'] += int(
+                            decoder_rgip_context['_rgip_attn_alignment_fallback'].detach().cpu()
+                        )
                 out = out.squeeze(dim=2)
                 # ------ 关键：Hint分支仅限shape完全对齐时融合，否则用student ------
                 if (
@@ -541,31 +719,70 @@ class PViC(nn.Module):
                     cw = cross_attn_weights
                     # 有的包实现返回list，多层，仅取最后一层
                     if isinstance(th, list):
-                        th = th[-1]
+                        th = th[-1] if len(th) > 0 else None
                     if isinstance(cw, list):
-                        cw = cw[-1]
+                        cw = cw[-1] if len(cw) > 0 else None
                     # 核心防呆：只有在完全shape一致时融合
-                    if th.shape == cw.shape:
+                    if th is not None and cw is not None and th.shape == cw.shape:
                         cross_attn_weights = (1 - attn_hint_alpha) * cw + attn_hint_alpha * th.detach()
                         # print(f"[Hint] Blended student & teacher at batch {i}")
                     else:
                         # print(f"[Hint] SKIPPED at batch {i}: student {cw.shape}, teacher {th.shape}")
-                        cross_attn_weights = cw
+                        cross_attn_weights = cw if cw is not None else cross_attn_weights
                 query_embeds[i] = out
                 cross_attn_weights_list[i] = cross_attn_weights
-        # cat之前加这段：
-        base_shape = (query_embeds[0].shape[0], query_embeds[0].shape[2])
+        # 将每张图的 decoder 输出沿 HO pair 维拼接。
+        # 注意：不同图片的 pair 数可以不同，甚至为 0；只能要求 decoder 层数和特征维度一致。
         query_embeds_to_cat = []
+        base_layers = None
+        base_dim = None
         for idx, q in enumerate(query_embeds):
-            if q.shape[0] == base_shape[0] and q.shape[2] == base_shape[1]:
+            if q is None:
+                continue
+            if q.dim() == 4 and q.shape[2] == 1:
+                q = q.squeeze(dim=2)
+            if q.dim() != 3:
+                pair_count = len(paired_inds[idx]) if idx < len(paired_inds) else -1
+                if pair_count == 0:
+                    continue
+                raise RuntimeError(f"Unexpected query embedding shape at image {idx}: {tuple(q.shape)}")
+            # 兼容旧 decoder 在 0 query + return_cross_attn=True 时被错误拆包后留下的畸形空张量。
+            if q.shape[0] == 0:
+                pair_count = len(paired_inds[idx]) if idx < len(paired_inds) else -1
+                if pair_count == 0:
+                    continue
+                raise RuntimeError(f"Unexpected empty decoder-layer dimension at image {idx}: {tuple(q.shape)}")
+            if base_layers is None:
+                base_layers = q.shape[0]
+                base_dim = q.shape[2]
+            if q.shape[0] == base_layers and q.shape[2] == base_dim:
                 query_embeds_to_cat.append(q)
             else:
-                print(f"[CAT SKIP] idx {idx}, shape {q.shape}, base {base_shape}", flush=True)
+                pair_count = len(paired_inds[idx]) if idx < len(paired_inds) else -1
+                if pair_count == 0:
+                    continue
+                raise RuntimeError(
+                    f"Query embedding layer/feature mismatch at image {idx}: "
+                    f"{tuple(q.shape)} vs expected (*,{base_layers},*,{base_dim})"
+                )
         if len(query_embeds_to_cat) == 0:
-            # fallback dummy
-            dummy = torch.zeros((base_shape[0], 1, base_shape[1]), device=query_embeds[0].device, dtype=query_embeds[0].dtype)
-            query_embeds_to_cat = [dummy]
-        query_embeds = torch.cat(query_embeds_to_cat, dim=1)
+            num_layers = int(getattr(self.decoder, 'num_layers', 1))
+            if not getattr(self.decoder, 'return_intermediate', True):
+                num_layers = 1
+            num_layers = max(num_layers, 1)
+            query_embeds = torch.zeros(
+                (num_layers, 0, self.repr_size),
+                device=memory.device,
+                dtype=memory.dtype,
+            )
+        else:
+            query_embeds = torch.cat(query_embeds_to_cat, dim=1)
+        expected_pairs = sum(len(p_inds) for p_inds in paired_inds)
+        if query_embeds.shape[1] != expected_pairs:
+            raise RuntimeError(
+                f"Concatenated query count mismatch: got {query_embeds.shape[1]}, "
+                f"expected {expected_pairs}"
+            )
         # query_embeds = torch.cat(query_embeds, dim=1)
         logits = self.binary_classifier(query_embeds)
         pred_logits = logits      # [num_decoder_layers, N_pairs, num_verbs]
@@ -580,11 +797,25 @@ class PViC(nn.Module):
             feat = query_embeds[-2]
         # feat = query_embeds[-2] if query_embeds.shape[0] > 1 else query_embeds[-1]  # [N_pairs, repr_dim]
 
-        if self.training:
+        if self.training or (targets is not None and return_outputs):
             labels = associate_with_ground_truth(
                 boxes, paired_inds, targets, self.num_verbs
             )
-            cls_loss = self.compute_classification_loss(logits, prior_scores, labels)
+            pair_weights = torch.ones(labels.shape[0], device=logits.device, dtype=logits.dtype)
+            if rgip_context is not None and len(paired_inds) > 0:
+                offset = 0
+                for local_img_idx, p_inds in enumerate(paired_inds):
+                    n_pairs = len(p_inds)
+                    global_idx = int(batch_indices[local_img_idx]) if batch_indices is not None else local_img_idx
+                    ctx = rgip_context.get(global_idx, None)
+                    if ctx is not None and 'pair_weights' in ctx and n_pairs > 0:
+                        src = ctx['pair_weights'].to(device=pair_weights.device, dtype=pair_weights.dtype)
+                        pair_weights[offset:offset + min(n_pairs, len(src))] = src[:n_pairs]
+                    offset += n_pairs
+
+            cls_loss = self.compute_classification_loss(
+                logits, prior_scores, labels, pair_weights=pair_weights
+            )
                 # 组装用于蒸馏的输出
 
             # 计算pair_image_indices
@@ -595,6 +826,21 @@ class PViC(nn.Module):
                 pair_idx_in_image.extend(list(range(len(p_inds))))
             pair_image_indices = torch.tensor(pair_image_indices, device=feat.device)  # [num_pairs]
             pair_idx_in_image = torch.tensor(pair_idx_in_image, device=feat.device)    # [num_pairs]
+            if batch_indices is not None and len(pair_image_indices) > 0:
+                pair_global_indices = torch.as_tensor(
+                    [int(batch_indices[int(img_idx)]) for img_idx in pair_image_indices.tolist()],
+                    device=feat.device,
+                    dtype=torch.long
+                )
+            else:
+                pair_global_indices = pair_image_indices.clone()
+
+            pair_objects = torch.cat(object_types, dim=0) if len(object_types) > 0 else torch.zeros(
+                0, device=feat.device, dtype=torch.long
+            )
+            pair_prior = torch.cat(prior_scores, dim=0).prod(1) if len(prior_scores) > 0 else torch.zeros(
+                0, self.num_verbs, device=feat.device, dtype=logits.dtype
+            )
 
 
             output_dict = {
@@ -603,8 +849,38 @@ class PViC(nn.Module):
                 'feat': feat,
                 'pair_image_indices': pair_image_indices,  # 新增
                 'pair_idx_in_image': pair_idx_in_image,    # 新增
+                'pair_labels': labels,
+                'pair_objects': pair_objects,
+                'pair_prior': pair_prior,
+                'pair_global_indices': pair_global_indices,
+                'paired_inds': paired_inds,
 
             }
+            if return_rgip_meta:
+                output_dict['rgip_pair_weights'] = pair_weights
+                output_dict['rgip_attn_stats'] = rgip_attn_stats
+                rgip_sis = torch.zeros_like(pair_weights)
+                rgip_confounder_ids = []
+                rgip_confounder_weights = []
+                offset = 0
+                for local_img_idx, p_inds in enumerate(paired_inds):
+                    n_pairs = len(p_inds)
+                    global_idx = int(batch_indices[local_img_idx]) if batch_indices is not None else local_img_idx
+                    ctx = rgip_context.get(global_idx, None) if rgip_context is not None else None
+                    if ctx is not None:
+                        if 'sis' in ctx:
+                            src = ctx['sis'].to(device=rgip_sis.device, dtype=rgip_sis.dtype)
+                            rgip_sis[offset:offset + min(n_pairs, len(src))] = src[:n_pairs]
+                        if 'confounder_hoi_ids' in ctx:
+                            rgip_confounder_ids.append(ctx['confounder_hoi_ids'][:n_pairs].to(feat.device))
+                        if 'confounder_weights' in ctx:
+                            rgip_confounder_weights.append(ctx['confounder_weights'][:n_pairs].to(feat.device))
+                    offset += n_pairs
+                output_dict['rgip_sis'] = rgip_sis
+                if rgip_confounder_ids:
+                    output_dict['rgip_confounder_ids'] = torch.cat(rgip_confounder_ids, dim=0)
+                if rgip_confounder_weights:
+                    output_dict['rgip_confounder_weights'] = torch.cat(rgip_confounder_weights, dim=0)
             #loss_dict = dict(cls_loss=cls_loss)
                     # pred_boxes（如果有）也可以加入
             if pred_boxes is not None:

@@ -5,21 +5,14 @@ import json
 import argparse
 import numpy as np
 import math
-from PIL import Image
+from PIL import Image, ImageFilter
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# 引入 pocket 库用于注意力热力图绘制
-import pocket
-import pocket.advis
-
-from matplotlib.colors import ListedColormap
-from pocket.advis.colours import build_continuous_cmap
-
 # Defaults are repository-relative; override them through the CLI below.
-MODEL_CKPT_BASELINE = 'outputs/baseline/latest.pth'
-MODEL_CKPT_MFD = 'outputs/incremental/best.pth'
-OUTPUT_DIR = 'infer_vis_results'
+MODEL_CKPT_BASELINE = '/data/hujm/pvic/outputs/pvic-detr-r50-hicodet-inc01-comp/latest.pth'
+MODEL_CKPT_MFD = '/data/hujm/pvic/outputs/pvic-detr-r50-hicodet-inc01-replayn20-d05/best.pth'
+OUTPUT_DIR = 'infer_vis_results/new01'
 N_SAMPLE = 5
 TEST_IMG_ROOT = 'hicodet/hico_20160224_det/images/test2015'
 CORRESPONDENCE_JSON = 'hoi_correspondence.json'
@@ -29,6 +22,13 @@ DETECTOR_TYPE = 'base'
 PARTITION = 'test2015'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 ONLY_RARE = False
+ATTN_CMAP = 'jet'
+ATTN_ALPHA = 0.62
+ATTN_DIM = 0.28
+ATTN_GAMMA = 0.75
+ATTN_BLUR = 9.0
+ATTN_VMIN_PERCENTILE = 2.0
+ATTN_VMAX_PERCENTILE = 98.0
 
 # ===== 指定图片名列表，为空则自动随机采样
 IMG_SPECIFIC = []
@@ -50,6 +50,20 @@ def parse_demo_args():
     parser.add_argument('--images', nargs='*', default=IMG_SPECIFIC,
                         help='Optional image file names; otherwise sample from image-root.')
     parser.add_argument('--only-rare', action='store_true', default=ONLY_RARE)
+    parser.add_argument('--attn-cmap', default=ATTN_CMAP,
+                        help='Matplotlib colormap for attention overlays. Use jet for the reference-paper style.')
+    parser.add_argument('--attn-alpha', type=float, default=ATTN_ALPHA,
+                        help='Maximum heatmap opacity. Higher values make the attention colours stronger.')
+    parser.add_argument('--attn-dim', type=float, default=ATTN_DIM,
+                        help='How much to darken the original image before overlaying the heatmap.')
+    parser.add_argument('--attn-gamma', type=float, default=ATTN_GAMMA,
+                        help='Gamma correction for the normalized attention map; lower values brighten weaker regions.')
+    parser.add_argument('--attn-blur', type=float, default=ATTN_BLUR,
+                        help='Gaussian blur radius applied after upsampling the attention map.')
+    parser.add_argument('--attn-vmin-percentile', type=float, default=ATTN_VMIN_PERCENTILE,
+                        help='Lower percentile used when normalizing attention values.')
+    parser.add_argument('--attn-vmax-percentile', type=float, default=ATTN_VMAX_PERCENTILE,
+                        help='Upper percentile used when normalizing attention values.')
     return parser.parse_args()
 
 def load_names_and_corres(json_path):
@@ -216,7 +230,60 @@ def visualize(image_np, results, coco_names, verb_names, img_name, model_tag, ou
     # 额外返回 best_for_pair 字典，供后续注意力提取使用
     return has_rare, best_for_pair
 
-def save_attention_maps(image_np, results, img_name, model_tag, outdir, best_for_pair, coco_names, verb_names):
+def normalize_attention_map(attn_map, gamma=ATTN_GAMMA,
+                            vmin_percentile=ATTN_VMIN_PERCENTILE,
+                            vmax_percentile=ATTN_VMAX_PERCENTILE):
+    """Robustly normalize one attention map into [0, 1] for visualisation."""
+    attn_np = attn_map.detach().float().cpu().numpy()
+    attn_np = np.nan_to_num(attn_np, nan=0.0, posinf=0.0, neginf=0.0)
+
+    lo = np.percentile(attn_np, vmin_percentile)
+    hi = np.percentile(attn_np, vmax_percentile)
+    if hi <= lo:
+        lo, hi = float(attn_np.min()), float(attn_np.max())
+    if hi <= lo:
+        return np.zeros_like(attn_np, dtype=np.float32)
+
+    attn_np = np.clip((attn_np - lo) / (hi - lo), 0.0, 1.0)
+    if gamma > 0:
+        attn_np = np.power(attn_np, gamma)
+    return attn_np.astype(np.float32)
+
+def render_attention_overlay(image_np, attn_map, cmap_name=ATTN_CMAP, alpha=ATTN_ALPHA,
+                             dim=ATTN_DIM, blur=ATTN_BLUR, gamma=ATTN_GAMMA,
+                             vmin_percentile=ATTN_VMIN_PERCENTILE,
+                             vmax_percentile=ATTN_VMAX_PERCENTILE):
+    """Render a vivid paper-style attention overlay similar to the provided reference image."""
+    img_h, img_w = image_np.shape[:2]
+    attn_np = normalize_attention_map(
+        attn_map,
+        gamma=gamma,
+        vmin_percentile=vmin_percentile,
+        vmax_percentile=vmax_percentile
+    )
+
+    attn_img = Image.fromarray((attn_np * 255).astype(np.uint8), mode='L')
+    resample = getattr(Image, 'Resampling', Image).BICUBIC
+    attn_img = attn_img.resize((img_w, img_h), resample=resample)
+    if blur > 0:
+        attn_img = attn_img.filter(ImageFilter.GaussianBlur(radius=blur))
+
+    attn_up = np.asarray(attn_img).astype(np.float32) / 255.0
+    heat_rgb = plt.get_cmap(cmap_name)(attn_up)[..., :3]
+
+    image_float = image_np.astype(np.float32) / 255.0
+    base = image_float * (1.0 - np.clip(dim, 0.0, 0.95))
+
+    # Keep a faint blue/green wash in low-response regions while making peaks bright red/yellow.
+    alpha_map = np.clip(alpha, 0.0, 1.0) * (0.35 + 0.65 * attn_up[..., None])
+    overlay = base * (1.0 - alpha_map) + heat_rgb * alpha_map
+    overlay = np.clip(overlay, 0.0, 1.0)
+    return Image.fromarray((overlay * 255).astype(np.uint8))
+
+def save_attention_maps(image_np, results, img_name, model_tag, outdir, best_for_pair, coco_names, verb_names,
+                        cmap_name=ATTN_CMAP, alpha=ATTN_ALPHA, dim=ATTN_DIM, blur=ATTN_BLUR,
+                        gamma=ATTN_GAMMA, vmin_percentile=ATTN_VMIN_PERCENTILE,
+                        vmax_percentile=ATTN_VMAX_PERCENTILE):
     """提取并保存纯净版注意力可视化图像"""
     if 'attn_weights' not in results or 'x' not in results:
         return
@@ -244,22 +311,23 @@ def save_attention_maps(image_np, results, img_name, model_tag, outdir, best_for
         objn = coco_names[coco_obj_id] if coco_obj_id < len(coco_names) else str(coco_obj_id)
         verbn = verb_names[verb_id] if verb_id < len(verb_names) else str(verb_id)
 
-        custom_red = build_continuous_cmap(
-            rgb_x=[1.0],                  # 终点位置
-            rgb_v=[(1.0, 0.8, 0.0)],      # 终点颜色为纯红色 (R, G, B)
-            alpha_v=[0.0, 0.95]            # 透明度从 0.0(完全透明) 渐变到 0.8(不透明)
-        )
         # 遍历输出 8 个注意力头
         for head_idx in range(8):
-            # 获取绝对无框、无字的原图副本，并转换为 PIL Image 格式
-            clean_image_np = image_np.copy()
-            clean_image_pil = Image.fromarray(clean_image_np)
-
             # 文件名：包含对齐信息的注意力图
             save_path = os.path.join(attn_dir, f"pair{idx}_H{human_idx}_{objn}_{verbn}_head{head_idx+1}.png")
 
-            # 使用 pocket 中的接口，渲染热力图并保存
-            pocket.advis.heatmap(clean_image_pil, attn_map[head_idx: head_idx+1], save_path=save_path, c_maps=custom_red)
+            overlay = render_attention_overlay(
+                image_np,
+                attn_map[head_idx],
+                cmap_name=cmap_name,
+                alpha=alpha,
+                dim=dim,
+                blur=blur,
+                gamma=gamma,
+                vmin_percentile=vmin_percentile,
+                vmax_percentile=vmax_percentile
+            )
+            overlay.save(save_path)
             plt.close('all')
 
 if __name__ == "__main__":
@@ -273,6 +341,13 @@ if __name__ == "__main__":
     N_SAMPLE = demo_args.num_samples
     IMG_SPECIFIC = demo_args.images
     ONLY_RARE = demo_args.only_rare
+    ATTN_CMAP = demo_args.attn_cmap
+    ATTN_ALPHA = demo_args.attn_alpha
+    ATTN_DIM = demo_args.attn_dim
+    ATTN_GAMMA = demo_args.attn_gamma
+    ATTN_BLUR = demo_args.attn_blur
+    ATTN_VMIN_PERCENTILE = demo_args.attn_vmin_percentile
+    ATTN_VMAX_PERCENTILE = demo_args.attn_vmax_percentile
 
     coco_names, verb_names, hico_object_names, correspondence = load_names_and_corres(CORRESPONDENCE_JSON)
     args, obj_to_verb = build_args_and_obj2verb()
@@ -359,5 +434,12 @@ if __name__ == "__main__":
             save_attention_maps(
                 image_np, results, img_name,
                 model_tag, OUTPUT_DIR,
-                best_for_pair, coco_names, verb_names
+                best_for_pair, coco_names, verb_names,
+                cmap_name=ATTN_CMAP,
+                alpha=ATTN_ALPHA,
+                dim=ATTN_DIM,
+                blur=ATTN_BLUR,
+                gamma=ATTN_GAMMA,
+                vmin_percentile=ATTN_VMIN_PERCENTILE,
+                vmax_percentile=ATTN_VMAX_PERCENTILE
             )
